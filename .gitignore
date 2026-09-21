@@ -1,0 +1,111 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+*.whl
+pip-wheel-metadata/
+.Python
+pybuild/
+
+# ---- Virtual Environment ----
+venv/
+env/
+ENV/
+.venv/
+.venv_*/
+
+# ---- Pycocotools / Local build artifacts ----
+*.o
+*.lo
+*.la
+*.a
+
+# ---- Test / Runtime Outputs ----
+*.mp4
+test_clip.mp4
+temp_*.mp4
+temp_output_*.mp4
+output_*.mp4
+*_output.mp4
+*.png
+*.jpg
+*.jpeg
+preview*.png
+*.gif
+
+# ---- ML Model Weights ----
+*.pt
+*.pth
+*.pkl
+*.onnx
+*.engine
+*.plan
+yolov8*.pt
+yolo*.pt
+
+# ---- Jupyter / Notebook ----
+.ipynb_checkpoints/
+*.ipynb
+
+# ---- IDE / Editors ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.project
+.pydevproject
+.settings/
+
+# ---- OS ----
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
+
+# ---- Logs & Caches ----
+logs/
+*.log
+*.log.*
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ---- Env & Secrets ----
+.env
+.env.local
+.env.*.local
+*.env
+.secrets
+*.key
+*.pem
+api_keys.json
+credentials.json
+
+# ---- FFmpeg / Temp processing ----
+tmp/
+temp/
+*.tmp
+*.temp
