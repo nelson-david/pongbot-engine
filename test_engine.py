@@ -1,8 +1,11 @@
+import argparse
+from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from tqdm import tqdm
-from renderer.video_processor import BroadcastRenderer
+from renderer.video_processor import BroadcastRenderer, merge_audio
+from enhancer.video_upscaler import RealESRGANEnhancer, enhance_broadcast_4k
 
 def setup_player_names(cap, model):
     """
@@ -51,34 +54,41 @@ def setup_player_names(cap, model):
     return p1_name, p2_name
 
 
-def run_visual_test(input_path: str, output_path: str):
-    print("Loading YOLOv8 model...")
-    model = YOLO("yolov8n.pt")
+from vision.tracker import MultiModelTracker
+from logic.state_machine import MatchScoreEngine
 
-    # Instantiate the new PIL-based BroadcastRenderer
-    renderer = BroadcastRenderer()
+def run_visual_test(
+    input_path: str = "test_clip.mp4",
+    output_path: str = "test_output.mp4",
+    mode: str = "standard",  # "standard", "broadcast4k", "realesrgan"
+    upscale_factor: int = 2,
+    model_name: str = "realesrgan-x4plus",
+):
+    print("Initializing MultiModelTracker and MatchScoreEngine...")
 
     cap = cv2.VideoCapture(input_path)
-    
-    # Prompt for custom player names using positional cues
-    p1_name, p2_name = setup_player_names(cap, model)
-
-    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    fps = int(round(cap.get(cv2.CAP_PROP_FPS))) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # Initialize Core Vision & Physics Subsystems
+    tracker = MultiModelTracker(yolo_model_path="yolov8n.pt", frame_width=width, frame_height=height)
+    renderer = BroadcastRenderer()
+
+    # Prompt for custom player names using positional cues
+    p1_name, p2_name = setup_player_names(cap, tracker.model)
+
+    # Initialize Table Tennis Scoring Engine
+    score_engine = MatchScoreEngine(p1_name=p1_name, p2_name=p2_name, initial_server=1)
+
+    # Use avc1 (native H.264) for crystal clear intermediate frames without mp4v degradation
+    temp_raw_path = "temp_raw_render.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    out = cv2.VideoWriter(temp_raw_path, fourcc, fps, (width, height))
 
     frame_count = 0
-    simulated_p1_score = 0
-    simulated_p2_score = 0
-    simulated_p1_games = 1
-    simulated_p2_games = 0
-    current_server = 1  # 1 = Player 1 serving, 2 = Player 2 serving
-
-    print(f"Processing '{input_path}' ({total_frames} total frames)...")
+    print(f"Processing '{input_path}' ({total_frames} total frames at {fps} fps)...")
 
     with tqdm(total=total_frames, desc="Rendering Engine", unit="frame") as pbar:
         while cap.isOpened():
@@ -89,39 +99,33 @@ def run_visual_test(input_path: str, output_path: str):
             frame_count += 1
             timestamp = frame_count / fps
 
-            results = model(frame, verbose=False)[0]
+            # 1. Automated Vision Tracking (Players + Table + Ball Trajectory)
+            players, physics_events = tracker.process_frame(frame, timestamp)
 
-            # 1. Draw Player Bounding Boxes & Tracking Labels
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                label = results.names[cls_id]
-                if label == "person":
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    center_x = (x1 + x2) / 2
-                    
-                    # Label bounding box based on left vs right side
-                    player_label = p1_name if center_x < (width / 2) else p2_name
-                    
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, player_label, (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            # 2. Automated Physics & Rule Engine Scoring
+            score_engine.update_physics_frame(timestamp, physics_events)
+            score_state = score_engine.get_score_state()
 
-            # 2. Simulated Event Trigger (e.g., point scored at 5-second mark)
-            if frame_count == fps * 5:
-                simulated_p1_score += 1
-                current_server = 2  # Switch service to Player 2
-                tqdm.write(f"[EVENT] Point scored at {timestamp:.2f}s! Score: {p1_name}={simulated_p1_score}, {p2_name}={simulated_p2_score}")
+            # 3. Log real detected game events
+            for ev in physics_events:
+                if ev.get("type") == "BOUNCE":
+                    tqdm.write(f"[PHYSICS] Ball bounce detected on Side {ev.get('side')} at {timestamp:.2f}s")
+                elif ev.get("type") == "HIT":
+                    tqdm.write(f"[PHYSICS] Player {ev.get('player')} paddle hit at {timestamp:.2f}s")
 
-            # 3. Burn High-Quality WTT Broadcast Overlay
+            # 4. Draw Player Boxes, Ball Trails, and Bounding Boxes
+            frame = tracker.draw_overlays(frame, p1_name=p1_name, p2_name=p2_name)
+
+            # 5. Burn WTT Modern Broadcast Scoreboard
             frame = renderer.draw_scorecard(
                 frame=frame,
-                p1_name=p1_name,
-                p2_name=p2_name,
-                p1_pts=simulated_p1_score,
-                p2_pts=simulated_p2_score,
-                p1_games=simulated_p1_games,
-                p2_games=simulated_p2_games,
-                server=current_server
+                p1_name=score_state["p1_name"],
+                p2_name=score_state["p2_name"],
+                p1_pts=score_state["p1_pts"],
+                p2_pts=score_state["p2_pts"],
+                p1_games=score_state["p1_games"],
+                p2_games=score_state["p2_games"],
+                server=score_state["server"]
             )
 
             out.write(frame)
@@ -129,7 +133,85 @@ def run_visual_test(input_path: str, output_path: str):
 
     cap.release()
     out.release()
+
+    print(f"\n--- MATCH EVENT SUMMARY ---")
+    print(f"Final Score: {p1_name} {score_state['p1_pts']} ({score_state['p1_games']} sets) - "
+          f"{p2_name} {score_state['p2_pts']} ({score_state['p2_games']} sets)")
+    print(f"Total Highlight Rallies Identified: {len(score_engine.vital_clips)}")
+    for start, end, desc in score_engine.vital_clips:
+        print(f"  • Highlight [{start:.1f}s - {end:.1f}s]: {desc}")
+
+    # 4. Final Optimization Phase (Audio Merging & Selected Quality Mode)
+    if mode == "realesrgan":
+        print("\n--- RUNNING REAL-ESRGAN AI SUPER-RESOLUTION ---")
+        enhancer = RealESRGANEnhancer(scale=upscale_factor, model_name=model_name)
+        enhancer.upscale_video(
+            input_video_path=temp_raw_path,
+            output_video_path=output_path,
+            source_audio_path=input_path,
+            preserve_audio=True
+        )
+        if Path(temp_raw_path).exists():
+            Path(temp_raw_path).unlink()
+
+    elif mode == "broadcast4k":
+        print("\n--- RUNNING BROADCAST 4K ENHANCEMENT ---")
+        enhance_broadcast_4k(
+            input_video_path=temp_raw_path,
+            output_video_path=output_path,
+            source_audio_path=input_path,
+            target_width=3840,
+            target_height=2160,
+            sharpness=0.5
+        )
+        if Path(temp_raw_path).exists():
+            Path(temp_raw_path).unlink()
+
+    else:
+        # Standard mode: Pristine H.264 encode with audio merged from input_path
+        print("\n--- FINALIZING PRISTINE 1080P OUTPUT WITH AUDIO ---")
+        merge_audio(
+            video_no_audio=temp_raw_path,
+            source_with_audio=input_path,
+            output_path=output_path,
+            clean_temp=True
+        )
+
     print(f"\nProcessing complete! Output saved to: {output_path}")
 
 if __name__ == "__main__":
-    run_visual_test("test_clip.mp4", "test_output.mp4")
+    parser = argparse.ArgumentParser(description="VideoEngine Test Pipeline")
+    parser.add_argument("--input", "-i", type=str, default="test_clip.mp4", help="Input video path")
+    parser.add_argument("--output", "-o", type=str, default="test_output.mp4", help="Output video path")
+    parser.add_argument("--mode", "-m", type=str, default=None,
+                        choices=["standard", "broadcast4k", "realesrgan"],
+                        help="Processing quality mode")
+    parser.add_argument("--scale", "-s", type=int, default=2, choices=[2, 3, 4], help="Upscale factor for Real-ESRGAN")
+    parser.add_argument("--model", type=str, default="realesrgan-x4plus",
+                        choices=["realesrgan-x4plus", "realesr-animevideov3", "realesrgan-x4plus-anime"],
+                        help="Real-ESRGAN model to use")
+    
+    args = parser.parse_args()
+
+    selected_mode = args.mode
+    if selected_mode is None:
+        print("\n--- OUTPUT RESOLUTION & QUALITY ---")
+        print("  [1] Standard 1080p (Fast, pristine H.264 camera quality + Audio)")
+        print("  [2] Broadcast 4K (Fast, 3840x2160 Lanczos + Adaptive Sharpening + Audio)")
+        print("  [3] Real-ESRGAN AI (Deep AI GAN Super-Resolution 2x/4x + Audio)")
+        choice = input("Select quality mode [1/2/3] (default: 1): ").strip()
+        if choice == "2":
+            selected_mode = "broadcast4k"
+        elif choice == "3":
+            selected_mode = "realesrgan"
+        else:
+            selected_mode = "standard"
+        print()
+
+    run_visual_test(
+        input_path=args.input,
+        output_path=args.output,
+        mode=selected_mode,
+        upscale_factor=args.scale,
+        model_name=args.model
+    )

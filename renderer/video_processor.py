@@ -1,27 +1,111 @@
 # engine/renderer/video_processor.py
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Union
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
+FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+
+
+def merge_audio(
+    video_no_audio: Union[str, Path],
+    source_with_audio: Union[str, Path],
+    output_path: Union[str, Path],
+    clean_temp: bool = False,
+    verbose: bool = False,
+) -> str:
+    """
+    Merges the video stream from `video_no_audio` with the audio stream from `source_with_audio`
+    into `output_path` using FFmpeg stream copy (lossless and near-instant).
+
+    Args:
+        video_no_audio: Path to the processed video without audio (e.g. from OpenCV VideoWriter).
+        source_with_audio: Path to the original input video containing the audio track.
+        output_path: Destination path for the merged video with audio.
+        clean_temp: If True, deletes `video_no_audio` after successful merge (if different from output_path).
+        verbose: If True, prints FFmpeg command output.
+
+    Returns:
+        str: The output path of the merged video.
+    """
+    video_no_audio = Path(video_no_audio).resolve()
+    source_with_audio = Path(source_with_audio).resolve()
+    output_path = Path(output_path).resolve()
+
+    if not video_no_audio.exists():
+        raise FileNotFoundError(f"Processed video not found: {video_no_audio}")
+    if not source_with_audio.exists():
+        raise FileNotFoundError(f"Source audio video not found: {source_with_audio}")
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        # Graceful fallback if ffmpeg is missing
+        if video_no_audio != output_path:
+            shutil.copy2(video_no_audio, output_path)
+        print("[WARNING] ffmpeg executable not found in PATH. Video saved without audio.")
+        return str(output_path)
+
+    # Ensure parent directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",                             # Overwrite destination file without prompting
+        "-i", str(video_no_audio),        # Input 0: Processed video frames
+        "-i", str(source_with_audio),     # Input 1: Original audio source
+        "-c:v", "copy",                   # Stream copy video track without re-encoding
+        "-c:a", "aac",                    # Encode/remux audio track to AAC
+        "-map", "0:v:0",                  # Map video from processed file
+        "-map", "1:a:0?",                 # Map audio from source if available (optional '?')
+        "-shortest",                      # Stop at the end of the shortest stream
+        str(output_path)
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE if not verbose else None,
+            stderr=subprocess.PIPE if not verbose else None,
+            check=True
+        )
+    except subprocess.CalledProcessError as e:
+        err_msg = e.stderr.decode() if e.stderr else str(e)
+        raise RuntimeError(f"FFmpeg audio merge failed:\n{err_msg}") from e
+
+    if clean_temp and video_no_audio != output_path and video_no_audio.exists():
+        try:
+            video_no_audio.unlink()
+        except OSError:
+            pass
+
+    return str(output_path)
+
 
 class BroadcastRenderer:
+    # Expose merge_audio as a static method on the class for convenience
+    merge_audio = staticmethod(merge_audio)
+
     def __init__(self, font_path: str = None, font_path_regular: str = None):
         """
         Initializes the rendering engine with custom font weights if available.
-        Falls back gracefully to default PIL system fonts if truetype paths are missing.
+        Falls back to bundled DM Sans fonts, then default PIL system fonts.
 
         Fonts are loaded at 2x their display size because the scorecard is drawn
         on a supersampled canvas (see SS_FACTOR in draw_scorecard) and downsampled
         for anti-aliasing.
         """
-        bold_path = font_path or "Helvetica-Bold.ttf"
-        regular_path = font_path_regular or "Helvetica.ttf"
+        bold_path = font_path or str(FONTS_DIR / "DMSans-Bold.ttf")
+        regular_path = font_path_regular or str(FONTS_DIR / "DMSans-Regular.ttf")
         try:
             self.font_name = ImageFont.truetype(bold_path, 40)
             self.font_pts = ImageFont.truetype(bold_path, 46)
             self.font_games = ImageFont.truetype(bold_path, 36)
         except OSError:
-            # Fallback for systems without local Helvetica files installed
+            # Fallback for systems without local font files installed
             self.font_name = ImageFont.load_default(size=40)
             self.font_pts = ImageFont.load_default(size=46)
             self.font_games = ImageFont.load_default(size=36)
