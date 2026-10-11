@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+FLAGS_DIR = Path(__file__).resolve().parent.parent / "assets" / "flags"
 
 
 def merge_audio(
@@ -21,16 +22,6 @@ def merge_audio(
     """
     Merges the video stream from `video_no_audio` with the audio stream from `source_with_audio`
     into `output_path` using FFmpeg stream copy (lossless and near-instant).
-
-    Args:
-        video_no_audio: Path to the processed video without audio (e.g. from OpenCV VideoWriter).
-        source_with_audio: Path to the original input video containing the audio track.
-        output_path: Destination path for the merged video with audio.
-        clean_temp: If True, deletes `video_no_audio` after successful merge (if different from output_path).
-        verbose: If True, prints FFmpeg command output.
-
-    Returns:
-        str: The output path of the merged video.
     """
     video_no_audio = Path(video_no_audio).resolve()
     source_with_audio = Path(source_with_audio).resolve()
@@ -43,25 +34,23 @@ def merge_audio(
 
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin:
-        # Graceful fallback if ffmpeg is missing
         if video_no_audio != output_path:
             shutil.copy2(video_no_audio, output_path)
         print("[WARNING] ffmpeg executable not found in PATH. Video saved without audio.")
         return str(output_path)
 
-    # Ensure parent directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [
         ffmpeg_bin,
-        "-y",                             # Overwrite destination file without prompting
-        "-i", str(video_no_audio),        # Input 0: Processed video frames
-        "-i", str(source_with_audio),     # Input 1: Original audio source
-        "-c:v", "copy",                   # Stream copy video track without re-encoding
-        "-c:a", "aac",                    # Encode/remux audio track to AAC
-        "-map", "0:v:0",                  # Map video from processed file
-        "-map", "1:a:0?",                 # Map audio from source if available (optional '?')
-        "-shortest",                      # Stop at the end of the shortest stream
+        "-y",
+        "-i", str(video_no_audio),
+        "-i", str(source_with_audio),
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-shortest",
         str(output_path)
     ]
 
@@ -89,32 +78,77 @@ class BroadcastRenderer:
     # Expose merge_audio as a static method on the class for convenience
     merge_audio = staticmethod(merge_audio)
 
-    def __init__(self, font_path: str = None, font_path_regular: str = None):
+    def __init__(self, font_path: str = None, font_path_regular: str = None, scale: float = 1.0):
         """
-        Initializes the rendering engine with custom font weights if available.
-        Falls back to bundled DM Sans fonts, then default PIL system fonts.
+        Initializes the rendering engine with modern compact sizing and flag support.
+        Base scale=1.0 creates a sleek 236x60px broadcast overlay.
+        """
+        self.scale = scale
+        self.bold_path = font_path or str(FONTS_DIR / "DMSans-Bold.ttf")
+        self.regular_path = font_path_regular or str(FONTS_DIR / "DMSans-Regular.ttf")
+        self._loaded_scale = None
+        self._load_fonts(self.scale)
+        self._flag_cache = {}
 
-        Fonts are loaded at 2x their display size because the scorecard is drawn
-        on a supersampled canvas (see SS_FACTOR in draw_scorecard) and downsampled
-        for anti-aliasing.
-        """
-        bold_path = font_path or str(FONTS_DIR / "DMSans-Bold.ttf")
-        regular_path = font_path_regular or str(FONTS_DIR / "DMSans-Regular.ttf")
+    def _load_fonts(self, scale: float):
+        self._loaded_scale = scale
         try:
-            self.font_name = ImageFont.truetype(bold_path, 40)
-            self.font_pts = ImageFont.truetype(bold_path, 46)
-            self.font_games = ImageFont.truetype(bold_path, 36)
+            self.font_name = ImageFont.truetype(self.bold_path, max(11, int(26 * scale)))
+            self.font_pts = ImageFont.truetype(self.bold_path, max(13, int(30 * scale)))
+            self.font_games = ImageFont.truetype(self.bold_path, max(10, int(23 * scale)))
         except OSError:
-            # Fallback for systems without local font files installed
-            self.font_name = ImageFont.load_default(size=40)
-            self.font_pts = ImageFont.load_default(size=46)
-            self.font_games = ImageFont.load_default(size=36)
+            self.font_name = ImageFont.load_default(size=max(11, int(26 * scale)))
+            self.font_pts = ImageFont.load_default(size=max(13, int(30 * scale)))
+            self.font_games = ImageFont.load_default(size=max(10, int(23 * scale)))
+
+    def get_flag_image(self, country_code: str, target_w: int, target_h: int) -> Image.Image:
+        """
+        Loads and returns a national flag icon resized to target dimensions.
+        Uses cached local assets in assets/flags/, downloads on-demand if needed,
+        or generates a clean 2-letter national code badge fallback.
+        """
+        country_code = (country_code or "NG").strip().upper()
+        cache_key = (country_code, target_w, target_h)
+        if cache_key in self._flag_cache:
+            return self._flag_cache[cache_key]
+
+        FLAGS_DIR.mkdir(parents=True, exist_ok=True)
+        flag_file = FLAGS_DIR / f"{country_code.lower()}.png"
+
+        # If not present locally, attempt to download
+        if not flag_file.exists():
+            import urllib.request
+            url = f"https://flagcdn.com/w40/{country_code.lower()}.png"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    flag_file.write_bytes(resp.read())
+            except Exception:
+                pass
+
+        if flag_file.exists():
+            try:
+                raw_flag = Image.open(flag_file).convert("RGBA")
+                flag_resized = raw_flag.resize((target_w, target_h), Image.LANCZOS)
+                self._flag_cache[cache_key] = flag_resized
+                return flag_resized
+            except Exception:
+                pass
+
+        # Stylized 2-letter fallback badge
+        badge = Image.new("RGBA", (target_w, target_h), (40, 40, 50, 255))
+        bdraw = ImageDraw.Draw(badge)
+        bdraw.rounded_rectangle([0, 0, target_w, target_h], radius=2, fill=(45, 45, 55, 255), outline=(120, 120, 140, 255))
+        bfont = ImageFont.load_default(size=max(8, target_h // 2))
+        bbox = bdraw.textbbox((0, 0), country_code[:2], font=bfont)
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        bdraw.text(((target_w - bw) // 2, (target_h - bh) // 2), country_code[:2], font=bfont, fill=(255, 255, 255, 255))
+        self._flag_cache[cache_key] = badge
+        return badge
 
     @staticmethod
     def _draw_centered(draw, box, text, font, fill):
-        """Draws `text` centered (both axes) inside box=(x0, y0, x1, y1),
-        using the glyph's actual ink bounding box so numerals sit dead-center
-        regardless of font metrics/padding quirks."""
+        """Draws `text` centered (both axes) inside box=(x0, y0, x1, y1)."""
         x0, y0, x1, y1 = box
         bbox = draw.textbbox((0, 0), text, font=font)
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -141,41 +175,44 @@ class BroadcastRenderer:
         p1_games: int = 0,
         p2_games: int = 0,
         server: int = 1,
+        p1_country: str = "NG",
+        p2_country: str = "NG",
+        scale: float = None,
     ) -> np.ndarray:
         """
-        Burns a WTT-style modern broadcast overlay on the frame.
-
-        Args:
-            frame: BGR image matrix from OpenCV.
-            p1_name: Top/far player name.
-            p2_name: Bottom/near player name.
-            p1_pts / p2_pts: Current points in active rally.
-            p1_games / p2_games: Total set/game score.
-            server: 1 if P1 is serving, 2 if P2 is serving.
+        Burns a WTT-style modern compact broadcast overlay with national flags on the frame.
         """
+        s = scale if scale is not None else self.scale
+        if s != self._loaded_scale:
+            self._load_fonts(s)
+
         h_frame, w_frame, _ = frame.shape
 
-        # ---- Layout (all in "display" pixels; SS_FACTOR supersamples for AA) ----
-        SS = 3  # supersample factor for smooth edges/text
-        row_h = 46
-        board_w = 380
+        # ---- Sleek compact dimensions ----
+        SS = 3  # supersample factor for smooth anti-aliased rendering
+        row_h = int(30 * s)
+        board_w = int(236 * s)
         board_h = row_h * 2
-        radius = 8
-        margin = 24  # extra canvas room so the drop shadow doesn't clip
+        radius = max(3, int(5 * s))
+        margin = max(10, int(16 * s))
 
         # Column breakpoints
-        serve_col_w = 14      # slim accent strip that marks who's serving
-        name_x0 = serve_col_w
-        pts_col_w = 64
-        games_col_w = 56
+        serve_col_w = max(6, int(8 * s))
+        flag_x0 = serve_col_w + max(4, int(5 * s))
+        flag_w = int(20 * s)
+        flag_h = int(14 * s)
+        name_x0 = flag_x0 + flag_w + max(4, int(6 * s))
+
+        pts_col_w = int(42 * s)
+        games_col_w = int(36 * s)
         pts_x0 = board_w - games_col_w - pts_col_w
         games_x0 = board_w - games_col_w
 
         # ---- Palette ----
         bg_dark = (20, 20, 24, 235)
-        bg_dark_alt = (26, 26, 31, 235)     # very slightly lighter, for row 2 -> subtle separation
+        bg_dark_alt = (26, 26, 31, 235)
         purple_accent = (168, 0, 255, 255)
-        purple_dim = (90, 20, 130, 255)     # accent strip when NOT serving
+        purple_dim = (90, 20, 130, 255)
         games_bg = (34, 34, 40, 240)
         text_white = (255, 255, 255, 255)
         text_muted = (160, 160, 168, 255)
@@ -185,25 +222,20 @@ class BroadcastRenderer:
         canvas_w = (board_w + margin * 2) * SS
         canvas_h = (board_h + margin * 2) * SS
         canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(canvas)
 
-        ox, oy = margin * SS, margin * SS  # board origin on the supersampled canvas
+        ox, oy = margin * SS, margin * SS
 
-        def R(*vals):
-            return tuple(v * SS for v in vals)
-
-        # ---- Soft drop shadow (blurred rounded rect behind the board) ----
+        # ---- Soft drop shadow ----
         shadow = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
         sdraw = ImageDraw.Draw(shadow)
         sdraw.rounded_rectangle(
-            [ox, oy + 4 * SS, ox + board_w * SS, oy + board_h * SS + 4 * SS],
+            [ox, oy + int(2 * s) * SS, ox + board_w * SS, oy + board_h * SS + int(2 * s) * SS],
             radius=radius * SS, fill=(0, 0, 0, 130),
         )
-        shadow = shadow.filter(ImageFilter.GaussianBlur(6 * SS))
+        shadow = shadow.filter(ImageFilter.GaussianBlur(int(4 * s) * SS))
         canvas = Image.alpha_composite(canvas, shadow)
-        draw = ImageDraw.Draw(canvas)
 
-        # ---- Board base (rounded, clips everything drawn inside it) ----
+        # ---- Board base ----
         board_mask = Image.new("L", (canvas_w, canvas_h), 0)
         ImageDraw.Draw(board_mask).rounded_rectangle(
             [ox, oy, ox + board_w * SS, oy + board_h * SS], radius=radius * SS, fill=255
@@ -213,6 +245,7 @@ class BroadcastRenderer:
 
         row_bgs = (bg_dark, bg_dark_alt)
         row_names = (p1_name, p2_name)
+        row_countries = (p1_country, p2_country)
         row_pts = (p1_pts, p2_pts)
         row_games = (p1_games, p2_games)
 
@@ -220,28 +253,36 @@ class BroadcastRenderer:
             ry0 = oy + i * row_h * SS
             ry1 = ry0 + row_h * SS
 
-            # Row background (name area)
+            # Row background
             bl_draw.rectangle([ox, ry0, ox + games_x0 * SS, ry1], fill=row_bgs[i])
-            # Points block (accent color, always visually "live")
+            # Points block
             bl_draw.rectangle([ox + pts_x0 * SS, ry0, ox + games_x0 * SS, ry1], fill=purple_accent)
             # Games/sets block
             bl_draw.rectangle([ox + games_x0 * SS, ry0, ox + board_w * SS, ry1], fill=games_bg)
 
-            # Serve indicator: slim vertical accent strip on the far edge of the row
+            # Serve indicator
             is_serving = (server == 1 and i == 0) or (server == 2 and i == 1)
             strip_fill = purple_accent if is_serving else purple_dim
             bl_draw.rectangle([ox, ry0, ox + serve_col_w * SS, ry1], fill=strip_fill)
 
-            # Player name: left-aligned, vertically centered in its column
+            # National Flag icon
+            flag_img = self.get_flag_image(row_countries[i], flag_w * SS, flag_h * SS)
+            fy = ry0 + (row_h * SS - flag_h * SS) // 2
+            fx = ox + flag_x0 * SS
+            board_layer.paste(flag_img, (fx, fy), mask=flag_img if flag_img.mode == "RGBA" else None)
+            # Subtle border around flag for contrast
+            bl_draw.rectangle([fx, fy, fx + flag_w * SS, fy + flag_h * SS], outline=(255, 255, 255, 45), width=1)
+
+            # Player name
             self._draw_left_vcenter(
                 bl_draw,
-                (ox + (name_x0 + 14) * SS, ry0, ox + (pts_x0 - 10) * SS, ry1),
+                (ox + name_x0 * SS, ry0, ox + (pts_x0 - int(4 * s)) * SS, ry1),
                 row_names[i].upper(),
                 self.font_name,
                 text_white,
             )
 
-            # Points value, centered in its block
+            # Points value
             self._draw_centered(
                 bl_draw,
                 (ox + pts_x0 * SS, ry0, ox + games_x0 * SS, ry1),
@@ -249,7 +290,7 @@ class BroadcastRenderer:
                 self.font_pts,
                 text_white,
             )
-            # Games value, centered, muted (secondary info)
+            # Games value
             self._draw_centered(
                 bl_draw,
                 (ox + games_x0 * SS, ry0, ox + board_w * SS, ry1),
@@ -264,12 +305,10 @@ class BroadcastRenderer:
             fill=divider, width=1 * SS,
         )
 
-        # Clip the row content to the rounded board shape, then composite
         transparent = Image.new("RGBA", board_layer.size, (0, 0, 0, 0))
         board_layer = Image.composite(board_layer, transparent, board_mask)
         canvas = Image.alpha_composite(canvas, board_layer)
 
-        # Hairline border for definition
         draw = ImageDraw.Draw(canvas)
         draw.rounded_rectangle(
             [ox, oy, ox + board_w * SS, oy + board_h * SS],
@@ -281,7 +320,7 @@ class BroadcastRenderer:
         overlay = canvas.resize((final_w, final_h), Image.LANCZOS)
 
         # ---- Composite onto the frame ----
-        pos_x, pos_y = 50 - margin, 50 - margin  # keep the board's visible top-left at (50, 50)
+        pos_x, pos_y = 30 - margin, 25 - margin  # Sleek top-left position (30, 25)
 
         frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA))
         frame_pil.paste(overlay, (pos_x, pos_y), mask=overlay)

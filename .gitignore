@@ -30,15 +30,12 @@ ENV/
 
 # ---- Test / Runtime Outputs ----
 *.mp4
-test_clip.mp4
-temp_*.mp4
-temp_output_*.mp4
-output_*.mp4
-*_output.mp4
+*.mov
+*.avi
+*.mkv
 *.png
 *.jpg
 *.jpeg
-preview*.png
 *.gif
 
 # ---- ML Model Weights ----
@@ -48,8 +45,14 @@ preview*.png
 *.onnx
 *.engine
 *.plan
-yolov8*.pt
-yolo*.pt
+
+# ---- Training Datasets (large, re-downloadable) ----
+datasets/table_tennis/
+datasets/*.zip
+datasets/*.tar.gz
+
+# ---- Training Runs / Checkpoints ----
+runs/
 
 # ---- Jupyter / Notebook ----
 .ipynb_checkpoints/

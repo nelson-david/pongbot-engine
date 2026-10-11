@@ -43,6 +43,9 @@ class MatchScoreEngine:
         self.bounce_count_on_side: int = 0
         self.exchange_count: int = 0
 
+        # Cooldown timer to prevent ball pickups from triggering new rallies
+        self.cooldown_until: float = 0.0
+
         # Vital highlight clips: [(start_time, end_time, rally_desc)]
         self.vital_clips: List[Tuple[float, float, str]] = []
         self.event_log: List[Dict] = []
@@ -51,6 +54,9 @@ class MatchScoreEngine:
         """
         Processes vision-detected physics events for the current video frame.
         """
+        # If in post-point cooldown, ignore stray ball bounces
+        in_cooldown = (timestamp < self.cooldown_until)
+
         for event in physics_events:
             ev_type = event.get("type")
 
@@ -63,8 +69,10 @@ class MatchScoreEngine:
 
                 # If idle or waiting, a bounce indicates rally has begun
                 if self.state in [GameState.WAITING_FOR_SERVE, GameState.POINT_SCORED]:
+                    if in_cooldown:
+                        continue
                     self.state = GameState.RALLY_IN_PROGRESS
-                    self.active_rally_start = max(0.0, timestamp - 1.0)
+                    self.active_rally_start = max(0.0, timestamp - 0.5)
                     self.last_hit_player = self.current_server
                     self.last_bounce_side = side
                     self.bounce_count_on_side = 1
@@ -75,10 +83,14 @@ class MatchScoreEngine:
                     if side == self.last_bounce_side:
                         # Ball bounced twice consecutively on the same side -> DOUBLE BOUNCE!
                         self.bounce_count_on_side += 1
-                        if self.bounce_count_on_side >= 2:
+                        if self.bounce_count_on_side >= 2 and self.exchange_count >= 2:
                             # The player defending this side failed to return it; striker wins point
                             scoring_player = 1 if side == 2 else 2
                             self._conclude_point(scoring_player, timestamp, reason=f"Double bounce on Side {side}")
+                        elif self.bounce_count_on_side >= 2:
+                            # Not enough exchanges — likely a false start / noise cluster
+                            self.state = GameState.WAITING_FOR_SERVE
+                            self.exchange_count = 0
                     else:
                         # Ball crossed net and bounced on opponent's half (Legitimate return)
                         self.last_bounce_side = side
@@ -96,34 +108,49 @@ class MatchScoreEngine:
                 if self.state == GameState.RALLY_IN_PROGRESS:
                     self.last_hit_player = player
                     self.bounce_count_on_side = 0
+                    self.exchange_count += 1
                     self._log_event("HIT", timestamp, f"Player {player} hit ball")
+                elif self.state in [GameState.WAITING_FOR_SERVE, GameState.POINT_SCORED] and not in_cooldown:
+                    # Serve hit initiates rally
+                    self.state = GameState.RALLY_IN_PROGRESS
+                    self.active_rally_start = timestamp
+                    self.last_hit_player = player
+                    self.bounce_count_on_side = 0
+                    self.exchange_count = 1
+                    self._log_event("RALLY_START", timestamp, f"Serve hit by Player {player}")
 
             # ---------------------------------------------------------
             # 3. OUT OF BOUNDS / FAULT EVENT
             # ---------------------------------------------------------
             elif ev_type == "OUT":
-                if self.state == GameState.RALLY_IN_PROGRESS:
+                if self.state == GameState.RALLY_IN_PROGRESS and self.exchange_count >= 2:
                     # Point goes to the opponent of the player who hit it out
                     scoring_player = 2 if self.last_hit_player == 1 else 1
                     self._conclude_point(scoring_player, timestamp, reason="Out of bounds")
 
         # ---------------------------------------------------------
         # 4. TIMEOUT / RALLY CONCLUSION CHECK
-        # If in active rally and no ball action for > 1.8 seconds, point has concluded
+        # If in active rally and no ball action for > 2.0 seconds, point has concluded.
+        # Guards against premature scoring:
+        #   - At least 3 exchanges (serve bounce + return bounce + 1 more)
+        #   - Rally must have lasted >= 1.0 second to rule out quick false-positive clusters
         # ---------------------------------------------------------
-        if self.state == GameState.RALLY_IN_PROGRESS and (timestamp - self.last_event_time) > 1.8:
-            # If the ball bounced on opponent's side and was never returned, last hitter wins
-            if self.last_bounce_side is not None:
+        if self.state == GameState.RALLY_IN_PROGRESS and (timestamp - self.last_event_time) > 2.0:
+            rally_duration = timestamp - self.active_rally_start
+            if self.exchange_count >= 3 and self.last_bounce_side is not None and rally_duration >= 1.0:
                 scoring_player = 1 if self.last_bounce_side == 2 else 2
                 self._conclude_point(scoring_player, timestamp, reason="Rally concluded (unreturned ball)")
             else:
+                # Stray bounce / false start without a genuine rally exchange
                 self.state = GameState.WAITING_FOR_SERVE
+                self.exchange_count = 0
 
     def _conclude_point(self, scoring_player: int, timestamp: float, reason: str = ""):
         """Awards point, updates games/sets, and rotates service."""
         self.state = GameState.POINT_SCORED
-        active_rally_end = timestamp + 0.8
-        rally_duration = active_rally_end - self.active_rally_start
+        self.cooldown_until = timestamp + 2.5  # 2.5s post-point cooldown for ball retrieval
+        active_rally_end = timestamp + 0.5
+        rally_duration = max(0.5, active_rally_end - self.active_rally_start)
 
         # Record vital highlight clip if rally duration is significant
         if rally_duration >= 3.0 or self.exchange_count >= 3:

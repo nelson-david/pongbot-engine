@@ -5,60 +5,80 @@ import numpy as np
 from ultralytics import YOLO
 from tqdm import tqdm
 from renderer.video_processor import BroadcastRenderer, merge_audio
+from renderer.country_selector import select_country
 from enhancer.video_upscaler import RealESRGANEnhancer, enhance_broadcast_4k
+from vision.tracker import MultiModelTracker, filter_players
+from logic.state_machine import MatchScoreEngine
 
-def setup_player_names(cap, model):
+
+def setup_player_names(cap, tracker):
     """
-    Reads the first valid frame, identifies player positions,
-    and prompts the user in the CLI to enter custom names.
+    Reads the first valid frame, identifies player positions (filtering out
+    umpires/spectators), locks their appearance profiles, and prompts the user in the CLI
+    for player names and country selections using arrow keys.
     """
     ret, frame = cap.read()
     if not ret:
-        return "Player 1", "Player 2"
+        return "Player 1", "NG", "Player 2", "NG"
     
     # Reset video capture back to frame 0
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    h, w = frame.shape[:2]
 
-    # Run inference on frame 1 to get initial player positions
-    results = model(frame, verbose=False)[0]
-    player_positions = []
+    # Run inference on frame 0 to get initial person detections
+    results = tracker.model(frame, verbose=False)[0]
+    detected_persons = []
 
     for box in results.boxes:
         cls_id = int(box.cls[0])
         label = results.names[cls_id]
-        if label == "person":
+        conf = float(box.conf[0])
+        if label == "person" and conf > 0.4:
             x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
             center_x = (x1 + x2) / 2
-            player_positions.append((center_x, (x1, y1, x2, y2)))
+            detected_persons.append({
+                "box": (x1, y1, x2, y2),
+                "center_x": center_x,
+                "conf": conf,
+            })
 
-    # Sort players horizontally (Left to Right) by center X coordinate
-    player_positions.sort(key=lambda item: item[0])
+    # Filter to actual court players only (excludes umpires in high chairs)
+    players = filter_players(detected_persons, frame_height=h, frame_width=w, max_players=2)
+    players.sort(key=lambda p: p["center_x"])
 
-    print("\n--- PLAYER IDENTIFICATION SETUP ---")
-    
-    # Ask for Left/Far side player name
-    if len(player_positions) > 0:
+    n_raw = len(detected_persons)
+    n_filtered = len(players)
+    print(f"\n--- PLAYER IDENTIFICATION & COUNTRY SETUP ---")
+    print(f"  Detected {n_raw} person(s) in frame, filtered to {n_filtered} player(s) (umpire/spectators excluded)")
+
+    # Ask for Left/Far side player name & country
+    if len(players) > 0:
         p1_input = input("Enter name for Player 1 [Left / Far Side]: ").strip()
         p1_name = p1_input if p1_input else "Player 1"
     else:
         p1_name = "Player 1"
 
-    # Ask for Right/Near side player name
-    if len(player_positions) > 1:
+    p1_country = select_country(f"Select country for {p1_name} [Left / Far Side]", default_code="NG")
+
+    # Ask for Right/Near side player name & country
+    if len(players) > 1:
         p2_input = input("Enter name for Player 2 [Right / Near Side]: ").strip()
         p2_name = p2_input if p2_input else "Player 2"
     else:
         p2_name = "Player 2"
 
-    print(f"Match configured: {p1_name} vs {p2_name}\n")
-    return p1_name, p2_name
+    p2_country = select_country(f"Select country for {p2_name} [Right / Near Side]", default_code="NG")
 
+    # Lock appearance profiles & calibrate court geometry immediately
+    if len(players) >= 2:
+        tracker.lock_player_profiles(frame, players[0]["box"], players[1]["box"])
+        print(f"  [LOCKED] Player 1 ({p1_name} - {p1_country}) & Player 2 ({p2_name} - {p2_country}) shirt appearance locked.")
 
-from vision.tracker import MultiModelTracker
-from logic.state_machine import MatchScoreEngine
+    print(f"Match configured: {p1_name} [{p1_country}] vs {p2_name} [{p2_country}]\n")
+    return p1_name, p1_country, p2_name, p2_country
 
 def run_visual_test(
-    input_path: str = "test_clip.mp4",
+    input_path: str = "test_clip_2.mov",
     output_path: str = "test_output.mp4",
     mode: str = "standard",  # "standard", "broadcast4k", "realesrgan"
     upscale_factor: int = 2,
@@ -76,8 +96,8 @@ def run_visual_test(
     tracker = MultiModelTracker(yolo_model_path="yolov8n.pt", frame_width=width, frame_height=height)
     renderer = BroadcastRenderer()
 
-    # Prompt for custom player names using positional cues
-    p1_name, p2_name = setup_player_names(cap, tracker.model)
+    # Prompt for custom player names & country selections using arrow keys
+    p1_name, p1_country, p2_name, p2_country = setup_player_names(cap, tracker)
 
     # Initialize Table Tennis Scoring Engine
     score_engine = MatchScoreEngine(p1_name=p1_name, p2_name=p2_name, initial_server=1)
@@ -88,6 +108,9 @@ def run_visual_test(
     out = cv2.VideoWriter(temp_raw_path, fourcc, fps, (width, height))
 
     frame_count = 0
+    ball_detect_count = 0
+    total_bounce_events = 0
+    total_hit_events = 0
     print(f"Processing '{input_path}' ({total_frames} total frames at {fps} fps)...")
 
     with tqdm(total=total_frames, desc="Rendering Engine", unit="frame") as pbar:
@@ -106,17 +129,31 @@ def run_visual_test(
             score_engine.update_physics_frame(timestamp, physics_events)
             score_state = score_engine.get_score_state()
 
+            # Track ball detection rate
+            if len(tracker.ball_tracker.history) > 0 and not tracker.ball_tracker.history[-1][3]:
+                ball_detect_count += 1
+
             # 3. Log real detected game events
             for ev in physics_events:
                 if ev.get("type") == "BOUNCE":
-                    tqdm.write(f"[PHYSICS] Ball bounce detected on Side {ev.get('side')} at {timestamp:.2f}s")
+                    total_bounce_events += 1
+                    tqdm.write(f"[BOUNCE] Side {ev.get('side')} at {timestamp:.2f}s | "
+                               f"Score: {score_state['p1_name']} {score_state['p1_pts']}-{score_state['p2_pts']} {score_state['p2_name']}")
                 elif ev.get("type") == "HIT":
-                    tqdm.write(f"[PHYSICS] Player {ev.get('player')} paddle hit at {timestamp:.2f}s")
+                    total_hit_events += 1
+                    tqdm.write(f"[HIT] Player {ev.get('player')} at {timestamp:.2f}s")
+
+            # Periodic stats every 300 frames
+            if frame_count % 300 == 0:
+                det_rate = (ball_detect_count / frame_count) * 100 if frame_count > 0 else 0
+                tqdm.write(f"[STATS] Frame {frame_count}: {len(players)} players tracked, "
+                           f"ball detected {ball_detect_count}/{frame_count} frames ({det_rate:.0f}%), "
+                           f"bounces={total_bounce_events}, hits={total_hit_events}")
 
             # 4. Draw Player Boxes, Ball Trails, and Bounding Boxes
             frame = tracker.draw_overlays(frame, p1_name=p1_name, p2_name=p2_name)
 
-            # 5. Burn WTT Modern Broadcast Scoreboard
+            # 5. Burn WTT Modern Compact Broadcast Scoreboard with National Flags
             frame = renderer.draw_scorecard(
                 frame=frame,
                 p1_name=score_state["p1_name"],
@@ -125,7 +162,9 @@ def run_visual_test(
                 p2_pts=score_state["p2_pts"],
                 p1_games=score_state["p1_games"],
                 p2_games=score_state["p2_games"],
-                server=score_state["server"]
+                server=score_state["server"],
+                p1_country=p1_country,
+                p2_country=p2_country,
             )
 
             out.write(frame)
@@ -135,11 +174,20 @@ def run_visual_test(
     out.release()
 
     print(f"\n--- MATCH EVENT SUMMARY ---")
-    print(f"Final Score: {p1_name} {score_state['p1_pts']} ({score_state['p1_games']} sets) - "
-          f"{p2_name} {score_state['p2_pts']} ({score_state['p2_games']} sets)")
+    det_rate = (ball_detect_count / frame_count) * 100 if frame_count > 0 else 0
+    print(f"Ball Detection Rate: {ball_detect_count}/{frame_count} frames ({det_rate:.1f}%)")
+    print(f"Total Physics Events: {total_bounce_events} bounces, {total_hit_events} hits")
+    print(f"Final Score: {p1_name} {score_state['p1_pts']} ({score_state['p1_games']} games) - "
+          f"{p2_name} {score_state['p2_pts']} ({score_state['p2_games']} games)")
     print(f"Total Highlight Rallies Identified: {len(score_engine.vital_clips)}")
     for start, end, desc in score_engine.vital_clips:
         print(f"  • Highlight [{start:.1f}s - {end:.1f}s]: {desc}")
+
+    # Dump the full event log for debugging
+    if score_engine.event_log:
+        print(f"\n--- EVENT LOG ({len(score_engine.event_log)} events) ---")
+        for entry in score_engine.event_log:
+            print(f"  [{entry['timestamp']:6.2f}s] {entry['event']:18s} | {entry['details']} | Score: {entry['score']}")
 
     # 4. Final Optimization Phase (Audio Merging & Selected Quality Mode)
     if mode == "realesrgan":
@@ -181,7 +229,7 @@ def run_visual_test(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VideoEngine Test Pipeline")
-    parser.add_argument("--input", "-i", type=str, default="test_clip.mp4", help="Input video path")
+    parser.add_argument("--input", "-i", type=str, default="test_clip_2.mov", help="Input video path")
     parser.add_argument("--output", "-o", type=str, default="test_output.mp4", help="Output video path")
     parser.add_argument("--mode", "-m", type=str, default=None,
                         choices=["standard", "broadcast4k", "realesrgan"],
