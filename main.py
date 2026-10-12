@@ -31,8 +31,14 @@ def run_engine(
     score_engine = MatchScoreEngine(p1_name=p1_name, p2_name=p2_name, initial_server=initial_server)
     renderer = BroadcastRenderer()
     
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
-    temp_processed_path = f"temp_{os.path.basename(output_video_path)}"
+    # Ensure absolute paths and destination directory exist
+    input_video_path = os.path.abspath(input_video_path)
+    output_video_path = os.path.abspath(output_video_path)
+    output_dir = os.path.dirname(output_video_path) or "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    temp_processed_path = os.path.join(output_dir, f"temp_{os.path.basename(output_video_path)}")
     out = cv2.VideoWriter(temp_processed_path, fourcc, fps, (width, height))
     
     frame_idx = 0
@@ -116,7 +122,11 @@ def run_engine(
             preserve_audio=True
         )
     else:
-        print("Video frame processing complete. Merging audio and finalizing output...")
+        merge_msg = "Video frame processing complete. Merging audio and finalizing output..."
+        print(merge_msg, flush=True)
+        if log_callback:
+            log_callback("INFO", merge_msg)
+
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", temp_processed_path,
@@ -128,12 +138,32 @@ def run_engine(
             "-shortest",
             output_video_path
         ]
-        subprocess.run(ffmpeg_cmd, check=True)
+
+        try:
+            subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            # Fallback if audio track mapping fails (e.g. video recorded without sound)
+            print(f"[WARNING] Audio merge failed ({e}), falling back to video-only encode...", flush=True)
+            fallback_cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_processed_path,
+                "-c:v", "libx264", "-crf", "21", "-preset", "fast",
+                "-an",
+                output_video_path
+            ]
+            subprocess.run(fallback_cmd, check=True)
     
     if os.path.exists(temp_processed_path):
-        os.remove(temp_processed_path)
+        try:
+            os.remove(temp_processed_path)
+        except OSError:
+            pass
 
-    print(f"Final sports video rendered successfully: {output_video_path}")
+    success_msg = f"Final sports video rendered successfully: {output_video_path}"
+    print(success_msg, flush=True)
+    if log_callback:
+        log_callback("SUCCESS", f"Broadcast video rendered: {os.path.basename(output_video_path)}")
+
     return score_engine.get_score_state()
 
 if __name__ == "__main__":
