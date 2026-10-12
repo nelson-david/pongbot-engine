@@ -127,12 +127,13 @@ def run_engine(
         if log_callback:
             log_callback("INFO", merge_msg)
 
+        # Primary attempt: Copy audio stream directly from input video (fast, lossless)
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-i", temp_processed_path,
             "-i", input_video_path,
             "-c:v", "libx264", "-crf", "21", "-preset", "fast",
-            "-c:a", "aac",
+            "-c:a", "copy",
             "-map", "0:v:0",
             "-map", "1:a:0?",
             "-shortest",
@@ -141,17 +142,33 @@ def run_engine(
 
         try:
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            # Fallback if audio track mapping fails (e.g. video recorded without sound)
-            print(f"[WARNING] Audio merge failed ({e}), falling back to video-only encode...", flush=True)
-            fallback_cmd = [
+        except subprocess.CalledProcessError:
+            # Secondary attempt: Transcode audio to aac if stream copy was incompatible
+            print("[INFO] Direct audio copy failed, re-encoding audio to AAC...", flush=True)
+            aac_cmd = [
                 "ffmpeg", "-y",
                 "-i", temp_processed_path,
+                "-i", input_video_path,
                 "-c:v", "libx264", "-crf", "21", "-preset", "fast",
-                "-an",
+                "-c:a", "aac", "-b:a", "192k",
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-shortest",
                 output_video_path
             ]
-            subprocess.run(fallback_cmd, check=True)
+            try:
+                subprocess.run(aac_cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as err:
+                # Final fallback if source video genuinely has no audio track
+                print(f"[WARNING] Source audio track unavailable ({err}), saving video without sound...", flush=True)
+                fallback_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", temp_processed_path,
+                    "-c:v", "libx264", "-crf", "21", "-preset", "fast",
+                    "-an",
+                    output_video_path
+                ]
+                subprocess.run(fallback_cmd, check=True)
     
     if os.path.exists(temp_processed_path):
         try:
