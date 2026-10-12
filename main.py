@@ -17,6 +17,7 @@ def run_engine(
     initial_server: int = 1,
     enable_upscale: bool = False,
     upscale_factor: int = 2,
+    show_debug_overlays: bool = False,
     progress_callback = None,
     log_callback = None,
 ):
@@ -82,7 +83,10 @@ def run_engine(
                     log_callback("BOUNCE" if ev['type'] == "BOUNCE" else "INFO", ev_msg, f"{timestamp:.2f}s")
         
         # 3. Render Visual Overlays & WTT Scoreboard
-        frame = tracker.draw_overlays(frame, p1_name=p1_name, p2_name=p2_name)
+        # Debug overlays (player bounding boxes, ball trajectory trail) are
+        # disabled by default for clean broadcast output.
+        if show_debug_overlays:
+            frame = tracker.draw_overlays(frame, p1_name=p1_name, p2_name=p2_name)
         frame_with_overlay = renderer.draw_scorecard(
             frame=frame,
             p1_name=score_state["p1_name"],
